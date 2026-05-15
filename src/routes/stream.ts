@@ -86,6 +86,7 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
       "Referer": "https://www.youtube.com/",
       "Origin": "https://www.youtube.com",
     };
+    
     const rangeHeader = req.headers.get("Range");
     if (rangeHeader) headers["Range"] = rangeHeader;
 
@@ -101,11 +102,23 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
     responseHeaders.set("Cache-Control", "public, max-age=3600");
     responseHeaders.set("Content-Type", response.headers.get("Content-Type") || "audio/mp4");
+    
     if (response.headers.get("Content-Length")) responseHeaders.set("Content-Length", response.headers.get("Content-Length")!);
     if (response.headers.get("Content-Range")) responseHeaders.set("Content-Range", response.headers.get("Content-Range")!);
     responseHeaders.set("Accept-Ranges", response.headers.get("Accept-Ranges") || "bytes");
 
-    return new Response(response.body, { status: response.status, headers: responseHeaders });
+    // SOLUSI AMAN: Gunakan TransformStream untuk mem-pipe data secara asinkron.
+    // Jika Flutter melakukan abort koneksi di tengah jalan (karena status 206), backend tidak akan melempar unhandled exception (HTTP 500).
+    const { readable, writable } = new TransformStream();
+    response.body?.pipeTo(writable).catch((err) => {
+      console.log("ℹ️ Stream di-abort oleh Flutter (Normal pada Range Request):", err.message);
+    });
+
+    return new Response(readable, { 
+      status: response.status, 
+      headers: responseHeaders 
+    });
+
   } catch (err) {
     return new Response("Proxy error: " + String(err), { status: 502, headers: corsHeaders });
   }
