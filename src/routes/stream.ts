@@ -70,10 +70,9 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
 
   try {
     const headers: Record<string, string> = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "User-Agent": "com.google.android.youtube/19.05.36 (Linux; U; Android 10; g-build) gzip",
       "Accept": "*/*",
-      "Referer": "https://www.youtube.com/",
-      "Origin": "https://www.youtube.com",
+      "Connection": "keep-alive",
     };
     
     const rangeHeader = req.headers.get("Range");
@@ -98,7 +97,7 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
 
     const { readable, writable } = new TransformStream();
     response.body?.pipeTo(writable).catch((err) => {
-      console.log("ℹ️ Stream di-abort oleh Flutter:", err.message);
+      console.log("ℹ " + err.message);
     });
 
     return new Response(readable, { status: response.status, headers: responseHeaders });
@@ -107,28 +106,6 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
   }
 }
 
-export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YTMusic): Promise<Response> {
-  const name = searchParams.get("name"), artist = searchParams.get("artist");
-  if (!name || !artist) return error("Missing name and artist");
-
-  const searchResults = await ytmusic.search(`${name} ${artist}`, "songs");
-  if (!searchResults.results?.length) return json({ success: false, error: "Song not found" }, 404);
-
-  const normalize = (s: string) => s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/gi, "").toLowerCase();
-  const nName = normalize(name);
-  const artistsList = artist.split(",").map(a => normalize(a));
-
-  const match = searchResults.results.find((song: any) => {
-    const nSongName = normalize(song.title || "");
-    const songArtists = (song.artists || []).map((a: any) => normalize(a.name || ""));
-    return (nSongName.includes(nName) || nName.includes(nSongName)) &&
-      artistsList.some(a => songArtists.some((sa: string) => sa.includes(a) || a.includes(sa)));
-  });
-
-  return match ? json({ success: true, data: match }) : json({ success: false, error: "Song not found" }, 404);
-}
-
-// Resolver tangguh: Selalu utamakan Piped, baru gunakan Invidious sebagai cadangan terakhir
 async function resolveUpstreamUrl(id: string): Promise<string> {
   try {
     const piped = await fetchFromPiped(id);
@@ -149,16 +126,22 @@ async function resolveUpstreamUrl(id: string): Promise<string> {
   throw new Error("Seluruh public instance (Piped/Invidious) gagal merespons.");
 }
 
+/**
+ * REVISI FINAL: SPOOFING GOOGLE VIDEO CDN VIA ANDROID MOBILE CLIENT AGAR BYPASS 403
+ */
 export async function handleStreamRelay(req: Request, id: string): Promise<Response> {
   try {
     console.log(`🚀 [Relay] Menghubungkan bita stream untuk videoId: ${id}`);
     const upstreamUrl = await resolveUpstreamUrl(id);
 
+    // KUNCI BYPASS: Menyamar murni menjadi paket aplikasi YouTube Android resmi
     const upstreamHeaders = new Headers({
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "User-Agent": "com.google.android.youtube/19.05.36 (Linux; U; Android 10; g-build) gzip",
       "Accept": "*/*",
-      "Referer": "https://www.youtube.com/",
-      "Origin": "https://www.youtube.com",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Connection": "keep-alive",
+      "X-YouTube-Client-Name": "3",
+      "X-YouTube-Client-Version": "19.05.36"
     });
     
     const rangeHeader = req.headers.get("Range");
