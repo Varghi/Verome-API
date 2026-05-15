@@ -16,8 +16,8 @@ import { html as uiHtml } from "./ui.ts";
 import { handleSearch, handleSearchSuggestions, handleYTSearch } from "./src/routes/search.ts";
 import { handleContentRoutes } from "./src/routes/content.ts";
 import { handleDiscoverRoutes } from "./src/routes/discover.ts";
-// REVISI: Tambahkan handleStreamRelay ke dalam daftar import dari stream.ts
-import { handleStream, handleProxy, handleMusicFind, handleStreamRelay } from "./src/routes/stream.ts";
+// REVISI: Tambahkan injectYtMusic ke dalam daftar import dari stream.ts
+import { handleStream, handleProxy, handleMusicFind, handleStreamRelay, injectYtMusic } from "./src/routes/stream.ts";
 import { handleInfoRoutes } from "./src/routes/info.ts";
 import { handleFeedRoutes } from "./src/routes/feed.ts";
 
@@ -25,6 +25,9 @@ import { handleFeedRoutes } from "./src/routes/feed.ts";
 
 const ytmusic = new YTMusic();
 const youtubeSearch = new YouTubeSearch();
+
+// REVISI UTAMA: Injeksi instance ytmusic ke route stream agar resolver mandiri aktif!
+injectYtMusic(ytmusic);
 
 // ─── Request Handler ────────────────────────────────────────
 
@@ -70,7 +73,7 @@ async function handler(req: Request): Promise<Response> {
     const discoverResponse = await handleDiscoverRoutes(pathname, searchParams, ytmusic, youtubeSearch);
     if (discoverResponse) return discoverResponse;
 
-    // ─── REVISI: Streaming Relay Proxy (Anti-403) ────────────
+    // ─── Streaming Relay Proxy (Anti-403) ────────────
     // Menangkap request dengan format /play/VIDEO_ID
     if (pathname.startsWith("/play/")) {
       const segments = pathname.split("/");

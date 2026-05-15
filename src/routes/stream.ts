@@ -1,16 +1,22 @@
 /**
  * Stream Routes
  * /api/stream, /api/proxy, /api/music/find, /play/:id
- * Optimized Architecture: Resilient Piping Proxy (Anti-502/Anti-307)
+ * Dedicated Architecture: Independent YTMusic Resolver (Bypass Piped/Invidious)
  */
 
 import { json, error, corsHeaders } from "../helpers/response.ts";
-import { fetchFromPiped, fetchFromInvidious } from "../services/streaming.ts";
 import type { YTMusic } from "../services/ytmusic.ts";
 
 const kv = typeof (globalThis as any).Deno?.openKv === "function" 
   ? await (globalThis as any).Deno.openKv() 
   : null;
+
+// Menggunakan YTMusic instance secara global untuk resolve streaming
+let globalYtMusic: YTMusic | null = null;
+
+export function injectYtMusic(ytmusicInstance: YTMusic) {
+  globalYtMusic = ytmusicInstance;
+}
 
 export async function handleStream(searchParams: URLSearchParams): Promise<Response> {
   const id = searchParams.get("id");
@@ -22,43 +28,47 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
     if (kv) {
       const cachedResult = await kv.get(cacheKey);
       if (cachedResult.value) {
-        console.log(`⚡ [Cache Hit] Mengembalikan data stream ID: ${id} dari Deno KV.`);
+        console.log(`⚡ [Cache Hit] Stream ID: ${id}`);
         return json(cachedResult.value);
       }
     }
 
-    console.log(`🐢 [Cache Miss] Mencari data streaming eksternal untuk ID: ${id}...`);
-
-    const piped = await fetchFromPiped(id);
-    if (piped.success) {
-      const responseData = {
-        success: true, service: "piped", instance: piped.instance,
-        streamingUrls: piped.streamingUrls, metadata: piped.metadata,
-        requestedId: id, timestamp: new Date().toISOString(),
-      };
-
-      if (kv) {
-        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
-      }
-      return json(responseData);
+    if (!globalYtMusic) {
+      return error("YTMusic service not initialized in stream route", 500);
     }
 
-    const invidious = await fetchFromInvidious(id);
-    if (invidious.success) {
-      const responseData = {
-        success: true, service: "invidious", instance: invidious.instance,
-        streamingUrls: invidious.streamingUrls, metadata: invidious.metadata,
-        requestedId: id, timestamp: new Date().toISOString(),
-      };
+    console.log(`🐢 [Direct Fetch] Mengambil manifest streaming dari YTMusic untuk ID: ${id}`);
+    
+    // Ambil detail format langsung dari core scraper backend lo
+    const streamingData = await globalYtMusic.getStreamingData(id);
+    
+    if (streamingData && streamingData.adaptiveFormats) {
+      const audioStreams = streamingData.adaptiveFormats.filter((f: any) => 
+        f.mimeType?.includes("audio")
+      );
 
-      if (kv) {
-        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
+      if (audioStreams.length) {
+        const responseData = {
+          success: true,
+          service: "ytmusic_direct",
+          streamingUrls: audioStreams.map((s: any) => ({
+            url: s.url,
+            quality: s.audioQuality || "medium",
+            mimeType: s.mimeType,
+            bitrate: s.bitrate,
+          })),
+          metadata: { id }
+        };
+
+        if (kv) {
+          await kv.set(cacheKey, responseData, { expireIn: 7200000 });
+        }
+        return json(responseData);
       }
-      return json(responseData);
     }
 
   } catch (err) {
-    console.error("❌ Deno KV Cache Error:", err);
+    console.error("❌ Stream Data Fetch Error:", err);
   }
 
   return json({ success: false, error: "No streaming data found" }, 404);
@@ -72,8 +82,8 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
     const headers: Record<string, string> = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       "Accept": "*/*",
-      "Referer": "https://www.youtube.com/",
-      "Origin": "https://www.youtube.com",
+      "Referer": "https://music.youtube.com/",
+      "Origin": "https://music.youtube.com",
     };
     
     const rangeHeader = req.headers.get("Range");
@@ -108,6 +118,9 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
 }
 
 export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YTMusic): Promise<Response> {
+  // Pastikan globalYtMusic terisi saat endpoint ini dipanggil
+  if (!globalYtMusic) globalYtMusic = ytmusic;
+
   const name = searchParams.get("name"), artist = searchParams.get("artist");
   if (!name || !artist) return error("Missing name and artist");
 
@@ -128,48 +141,41 @@ export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YT
   return match ? json({ success: true, data: match }) : json({ success: false, error: "Song not found" }, 404);
 }
 
-async function resolveUpstreamUrl(id: string): Promise<string> {
-  try {
-    const piped = await fetchFromPiped(id);
-    if (piped.success && piped.streamingUrls?.length) {
-      const audioStreams = piped.streamingUrls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
-      if (audioStreams.length > 0) return audioStreams[0].url;
-      return piped.streamingUrls[0].url;
-    }
-  } catch (_err) {}
-
-  try {
-    const invidious = await fetchFromInvidious(id);
-    if (invidious.success && invidious.streamingUrls?.length) {
-      return invidious.streamingUrls[0].url;
-    }
-  } catch (_err) {}
-
-  throw new Error("Gagal mengamankan manifes URL streaming hulu.");
-}
-
 /**
- * REVISI TOTAL: PIPING PROXY AMAN (MENGHINDARI REDIRECT JIKA EXOPLAYER MENOLAK)
- * Server Deno bertindak sebagai jembatan bita langsung (Piping Body stream murni)
+ * HANDLER STREAM RELAY (PIPING PROXY DENGAN YT MUSIC RESOLVER)
  */
 export async function handleStreamRelay(req: Request, id: string): Promise<Response> {
   try {
-    console.log(`🚀 [Relay Engine] Menarik data manifes stream untuk videoId: ${id}`);
-    const upstreamUrl = await resolveUpstreamUrl(id);
+    console.log(`🚀 [Relay Engine] Meminta direct stream untuk videoId: ${id}`);
     
-    // Siapkan Header Penyamaran Tingkat Tinggi agar lolos 403 dari YouTube CDN
+    if (!globalYtMusic) {
+      throw new Error("YTMusic instance belum terinisialisasi.");
+    }
+
+    const streamingData = await globalYtMusic.getStreamingData(id);
+    if (!streamingData || !streamingData.adaptiveFormats) {
+      throw new Error("Format adaptif tidak ditemukan pada manifest YouTube.");
+    }
+
+    const audioStreams = streamingData.adaptiveFormats.filter((f: any) => f.mimeType?.includes("audio"));
+    if (!audioStreams.length) {
+      throw new Error("Tidak ada stream audio yang tersedia.");
+    }
+
+    // Pilih stream audio dengan bitrate terbaik atau indeks pertama
+    const upstreamUrl = audioStreams[0].url;
+
     const upstreamHeaders = new Headers({
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
       "Accept": "*/*",
       "Accept-Language": "en-US,en;q=0.9",
-      "Referer": "https://www.youtube.com/",
-      "Origin": "https://www.youtube.com",
+      "Referer": "https://music.youtube.com/",
+      "Origin": "https://music.youtube.com",
     });
     
     const rangeHeader = req.headers.get("Range");
     if (rangeHeader) {
       upstreamHeaders.set("Range", rangeHeader);
-      console.log(`🎯 [Range Applied] Meneruskan data bita range: ${rangeHeader}`);
     }
 
     const upstreamController = new AbortController();
@@ -179,17 +185,13 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
       });
     }
 
-    // Eksekusi penarikan bita langsung dari server Deno
     const upstreamResp = await fetch(upstreamUrl, {
       method: "GET",
       headers: upstreamHeaders,
       signal: upstreamController.signal,
     });
 
-    console.log(`📡 [CDN Status] Hulu mengembalikan nilai status: ${upstreamResp.status}`);
-
     if (!upstreamResp.ok && upstreamResp.status !== 206) {
-      console.error(`❌ Upstream menolak mentah-mentah dengan status: ${upstreamResp.status}`);
       return new Response(`Upstream rejected: ${upstreamResp.status}`, { status: 502 });
     }
 
@@ -209,11 +211,8 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
     if (upstreamResp.headers.get("Content-Range")) responseHeaders.set("Content-Range", upstreamResp.headers.get("Content-Range")!);
     responseHeaders.set("Accept-Ranges", upstreamResp.headers.get("Accept-Ranges") || "bytes");
 
-    // Alirkan bita media secara asinkron murni lewat TransformStream menuju ExoPlayer
     const { readable, writable } = new TransformStream();
-    upstreamResp.body?.pipeTo(writable).catch((err) => {
-      console.log(`ℹ️ [Piping Closed] Aliran bita selesai dilepaskan: ${err.message}`);
-    });
+    upstreamResp.body?.pipeTo(writable).catch((_err) => {});
 
     return new Response(readable, {
       status: upstreamResp.status,
