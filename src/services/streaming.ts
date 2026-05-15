@@ -1,14 +1,14 @@
 /**
  * Streaming Service
  * Fetches audio stream URLs from Piped and Invidious instances
- * Fully Optimized for Deno Relay & Anti-403
+ * Fully Optimized for Deno Relay, Anti-403 & Fast Fallback (Anti-Timeout)
  */
 
 let instancesCache: any = null;
 let instancesCacheTime = 0;
 const CACHE_DURATION = 5 * 60 * 1000;
 
-// List instance Piped yang diperbarui (Dipilih yang stabil dan IP-nya bersih dari blokir Google)
+// List instance Piped pilihan yang terkenal berkecepatan tinggi
 const PIPED_INSTANCES = [
   "https://pipedapi.lunar.icu",
   "https://api.piped.privacydev.net",
@@ -20,7 +20,7 @@ const PIPED_INSTANCES = [
   "https://pipedapi.leptons.xyz",
 ];
 
-// List instance Invidious cadangan yang handal
+// List instance Invidious cadangan yang responsif
 const INVIDIOUS_INSTANCES = [
   "https://invidious.nerdvpn.de",
   "https://invidious.flokinet.to",
@@ -36,10 +36,11 @@ async function getDynamicInstances() {
   }
 
   try {
-    const response = await fetch("https://raw.githubusercontent.com/n-ce/Uma/main/dynamic_instances.json");
+    const response = await fetch("https://raw.githubusercontent.com/n-ce/Uma/main/dynamic_instances.json", {
+      signal: AbortSignal.timeout(3000) // Batasi fetch github max 3 detik
+    });
     const data = await response.json();
     
-    // Gabungkan instance tangguh milik kita dengan hasil fetch dynamic github
     data.piped = [...new Set([...PIPED_INSTANCES, ...(data.piped || [])])];
     data.invidious = [...new Set([...INVIDIOUS_INSTANCES, ...(data.invidious || [])])];
     
@@ -60,10 +61,12 @@ export async function fetchFromPiped(videoId: string) {
 
   for (const instance of pipedInstances) {
     try {
+      // PERBAIKAN VITAL: Jika server tidak membalas dalam 2.5 detik, auto skip ke server berikutnya!
       const response = await fetch(`${instance}/streams/${videoId}`, {
         headers: { 
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" 
         },
+        signal: AbortSignal.timeout(2500) 
       });
       
       if (!response.ok) continue;
@@ -71,7 +74,6 @@ export async function fetchFromPiped(videoId: string) {
 
       if (data?.error) continue;
 
-      // Kunci Utama: Ekstrak audio dari properti biasa ATAU fallback saringan dari adaptiveFormats
       let audioStreams = data?.audioStreams || [];
       if (!audioStreams.length && data?.adaptiveFormats?.length) {
         audioStreams = data.adaptiveFormats.filter((f: any) => f.mimeType?.includes("audio"));
@@ -105,6 +107,7 @@ export async function fetchFromPiped(videoId: string) {
         };
       }
     } catch (_err) {
+      // Timeout atau network error langsung ditangkap di sini dan loop berlanjut dengan cepat
       continue;
     }
   }
@@ -118,12 +121,14 @@ export async function fetchFromInvidious(videoId: string) {
 
   for (const instance of invidiousInstances) {
     try {
-      const response = await fetch(`${instance}/api/v1/videos/${videoId}?fields=title,author,adaptiveFormats,videoThumbnails,lengthSeconds,viewCount`);
+      // PERBAIKAN VITAL: Beri timeout juga pada Invidious agar tidak memicu bottleneck waktu
+      const response = await fetch(`${instance}/api/v1/videos/${videoId}?fields=title,author,adaptiveFormats,videoThumbnails,lengthSeconds,viewCount`, {
+        signal: AbortSignal.timeout(2500)
+      });
       if (!response.ok) continue;
       const data = await response.json();
 
       if (data && data.adaptiveFormats) {
-        // Saring bita audio murni saja
         const audioFormats = data.adaptiveFormats.filter((f: any) =>
           f.type?.includes("audio") || f.mimeType?.includes("audio")
         );
@@ -134,7 +139,6 @@ export async function fetchFromInvidious(videoId: string) {
           return {
             success: true,
             instance,
-            // Perbaikan Fatal: Ambil langsung f.url (direct URL googlevideo) agar tidak kena 403 via proxy/latest_version
             streamingUrls: audioFormats.map((f: any) => ({
               url: f.url, 
               directUrl: f.url,
