@@ -7,8 +7,10 @@ import { json, error, corsHeaders } from "../helpers/response.ts";
 import { fetchFromPiped, fetchFromInvidious } from "../services/streaming.ts";
 import type { YTMusic } from "../services/ytmusic.ts";
 
-// 1. Inisialisasi Deno KV untuk database caching global
-const kv = await Deno.openKv();
+// 1. Inisialisasi Deno KV secara dinamis dengan safe check agar tidak crash jika flag '--unstable-kv' belum aktif
+const kv = typeof (globalThis as any).Deno?.openKv === "function" 
+  ? await (globalThis as any).Deno.openKv() 
+  : null;
 
 export async function handleStream(searchParams: URLSearchParams): Promise<Response> {
   const id = searchParams.get("id");
@@ -18,11 +20,13 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
   const cacheKey = ["stream_cache", id];
 
   try {
-    // 2. Cek apakah data streaming lagu ini sudah ada di dalam Cache Deno KV
-    const cachedResult = await kv.get(cacheKey);
-    if (cachedResult.value) {
-      console.log(`⚡ [Cache Hit] Memangkas latency! Mengembalikan data stream ID: ${id} dari Deno KV.`);
-      return json(cachedResult.value);
+    // 2. Cek apakah data streaming ada di Cache Deno KV (Hanya dijalankan jika objek kv tersedia)
+    if (kv) {
+      const cachedResult = await kv.get(cacheKey);
+      if (cachedResult.value) {
+        console.log(`⚡ [Cache Hit] Memangkas latency! Mengembalikan data stream ID: ${id} dari Deno KV.`);
+        return json(cachedResult.value);
+      }
     }
 
     console.log(`🐢 [Cache Miss] Mencari data streaming eksternal untuk ID: ${id}...`);
@@ -36,9 +40,11 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
         requestedId: id, timestamp: new Date().toISOString(),
       };
 
-      // Simpan ke Deno KV selama 2 jam (7.200.000 ms) sebelum token expired
-      await kv.set(cacheKey, responseData, { expireIn: 7200000 });
-      console.log(`💾 [Cache Stored] Data stream dari Piped berhasil disimpan ke Deno KV.`);
+      // Simpan ke Deno KV selama 2 jam jika objek kv aktif
+      if (kv) {
+        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
+        console.log(`💾 [Cache Stored] Data stream dari Piped berhasil disimpan ke Deno KV.`);
+      }
       
       return json(responseData);
     }
@@ -52,16 +58,18 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
         requestedId: id, timestamp: new Date().toISOString(),
       };
 
-      // Simpan ke Deno KV selama 2 jam (7.200.000 ms) sebelum token expired
-      await kv.set(cacheKey, responseData, { expireIn: 7200000 });
-      console.log(`💾 [Cache Stored] Data stream dari Invidious berhasil disimpan ke Deno KV.`);
+      // Simpan ke Deno KV selama 2 jam jika objek kv aktif
+      if (kv) {
+        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
+        console.log(`💾 [Cache Stored] Data stream dari Invidious berhasil disimpan ke Deno KV.`);
+      }
       
       return json(responseData);
     }
 
   } catch (err) {
     console.error("❌ Deno KV Cache Error:", err);
-    // Jika cache bermasalah, bypass langsung tanpa cache agar API tidak total mati
+    // Jalankan fallback: Abaikan cache jika terjadi error internal, langsung tembak eksternal
   }
 
   return json({ success: false, error: "No streaming data found" }, 404);
