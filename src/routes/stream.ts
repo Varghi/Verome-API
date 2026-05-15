@@ -1,22 +1,16 @@
 /**
  * Stream Routes
  * /api/stream, /api/proxy, /api/music/find, /play/:id
- * Dedicated Architecture: Independent YTMusic Resolver (Bypass Piped/Invidious)
+ * Hardened Architecture: Pure Streaming Piping via Resilient Fallback
  */
 
 import { json, error, corsHeaders } from "../helpers/response.ts";
+import { fetchFromPiped, fetchFromInvidious } from "../services/streaming.ts";
 import type { YTMusic } from "../services/ytmusic.ts";
 
 const kv = typeof (globalThis as any).Deno?.openKv === "function" 
   ? await (globalThis as any).Deno.openKv() 
   : null;
-
-// Menggunakan YTMusic instance secara global untuk resolve streaming
-let globalYtMusic: YTMusic | null = null;
-
-export function injectYtMusic(ytmusicInstance: YTMusic) {
-  globalYtMusic = ytmusicInstance;
-}
 
 export async function handleStream(searchParams: URLSearchParams): Promise<Response> {
   const id = searchParams.get("id");
@@ -28,47 +22,43 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
     if (kv) {
       const cachedResult = await kv.get(cacheKey);
       if (cachedResult.value) {
-        console.log(`⚡ [Cache Hit] Stream ID: ${id}`);
+        console.log(`⚡ [Cache Hit] Memangkas latency stream ID: ${id}`);
         return json(cachedResult.value);
       }
     }
 
-    if (!globalYtMusic) {
-      return error("YTMusic service not initialized in stream route", 500);
+    console.log(`🐢 [Cache Miss] Mencari data streaming eksternal untuk ID: ${id}...`);
+
+    const piped = await fetchFromPiped(id);
+    if (piped.success) {
+      const responseData = {
+        success: true, service: "piped", instance: piped.instance,
+        streamingUrls: piped.streamingUrls, metadata: piped.metadata,
+        requestedId: id, timestamp: new Date().toISOString(),
+      };
+
+      if (kv) {
+        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
+      }
+      return json(responseData);
     }
 
-    console.log(`🐢 [Direct Fetch] Mengambil manifest streaming dari YTMusic untuk ID: ${id}`);
-    
-    // Ambil detail format langsung dari core scraper backend lo
-    const streamingData = await globalYtMusic.getStreamingData(id);
-    
-    if (streamingData && streamingData.adaptiveFormats) {
-      const audioStreams = streamingData.adaptiveFormats.filter((f: any) => 
-        f.mimeType?.includes("audio")
-      );
+    const invidious = await fetchFromInvidious(id);
+    if (invidious.success) {
+      const responseData = {
+        success: true, service: "invidious", instance: invidious.instance,
+        streamingUrls: invidious.streamingUrls, metadata: invidious.metadata,
+        requestedId: id, timestamp: new Date().toISOString(),
+      };
 
-      if (audioStreams.length) {
-        const responseData = {
-          success: true,
-          service: "ytmusic_direct",
-          streamingUrls: audioStreams.map((s: any) => ({
-            url: s.url,
-            quality: s.audioQuality || "medium",
-            mimeType: s.mimeType,
-            bitrate: s.bitrate,
-          })),
-          metadata: { id }
-        };
-
-        if (kv) {
-          await kv.set(cacheKey, responseData, { expireIn: 7200000 });
-        }
-        return json(responseData);
+      if (kv) {
+        await kv.set(cacheKey, responseData, { expireIn: 7200000 });
       }
+      return json(responseData);
     }
 
   } catch (err) {
-    console.error("❌ Stream Data Fetch Error:", err);
+    console.error("❌ Deno KV Cache Error:", err);
   }
 
   return json({ success: false, error: "No streaming data found" }, 404);
@@ -82,8 +72,8 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
     const headers: Record<string, string> = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       "Accept": "*/*",
-      "Referer": "https://music.youtube.com/",
-      "Origin": "https://music.youtube.com",
+      "Referer": "https://www.youtube.com/",
+      "Origin": "https://www.youtube.com",
     };
     
     const rangeHeader = req.headers.get("Range");
@@ -108,7 +98,7 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
 
     const { readable, writable } = new TransformStream();
     response.body?.pipeTo(writable).catch((err) => {
-      console.log("ℹ️ Proxy Stream di-abort:", err.message);
+      console.log("ℹ️ Stream di-abort oleh Flutter:", err.message);
     });
 
     return new Response(readable, { status: response.status, headers: responseHeaders });
@@ -118,9 +108,6 @@ export async function handleProxy(searchParams: URLSearchParams, req: Request): 
 }
 
 export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YTMusic): Promise<Response> {
-  // Pastikan globalYtMusic terisi saat endpoint ini dipanggil
-  if (!globalYtMusic) globalYtMusic = ytmusic;
-
   const name = searchParams.get("name"), artist = searchParams.get("artist");
   if (!name || !artist) return error("Missing name and artist");
 
@@ -141,36 +128,37 @@ export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YT
   return match ? json({ success: true, data: match }) : json({ success: false, error: "Song not found" }, 404);
 }
 
-/**
- * HANDLER STREAM RELAY (PIPING PROXY DENGAN YT MUSIC RESOLVER)
- */
+// Resolver tangguh: Selalu utamakan Piped, baru gunakan Invidious sebagai cadangan terakhir
+async function resolveUpstreamUrl(id: string): Promise<string> {
+  try {
+    const piped = await fetchFromPiped(id);
+    if (piped.success && piped.streamingUrls?.length) {
+      const audioStreams = piped.streamingUrls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
+      if (audioStreams.length > 0) return audioStreams[0].url;
+      return piped.streamingUrls[0].url;
+    }
+  } catch (_err) {}
+
+  try {
+    const invidious = await fetchFromInvidious(id);
+    if (invidious.success && invidious.streamingUrls?.length) {
+      return invidious.streamingUrls[0].url;
+    }
+  } catch (_err) {}
+
+  throw new Error("Seluruh public instance (Piped/Invidious) gagal merespons.");
+}
+
 export async function handleStreamRelay(req: Request, id: string): Promise<Response> {
   try {
-    console.log(`🚀 [Relay Engine] Meminta direct stream untuk videoId: ${id}`);
-    
-    if (!globalYtMusic) {
-      throw new Error("YTMusic instance belum terinisialisasi.");
-    }
-
-    const streamingData = await globalYtMusic.getStreamingData(id);
-    if (!streamingData || !streamingData.adaptiveFormats) {
-      throw new Error("Format adaptif tidak ditemukan pada manifest YouTube.");
-    }
-
-    const audioStreams = streamingData.adaptiveFormats.filter((f: any) => f.mimeType?.includes("audio"));
-    if (!audioStreams.length) {
-      throw new Error("Tidak ada stream audio yang tersedia.");
-    }
-
-    // Pilih stream audio dengan bitrate terbaik atau indeks pertama
-    const upstreamUrl = audioStreams[0].url;
+    console.log(`🚀 [Relay] Menghubungkan bita stream untuk videoId: ${id}`);
+    const upstreamUrl = await resolveUpstreamUrl(id);
 
     const upstreamHeaders = new Headers({
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
       "Accept": "*/*",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Referer": "https://music.youtube.com/",
-      "Origin": "https://music.youtube.com",
+      "Referer": "https://www.youtube.com/",
+      "Origin": "https://www.youtube.com",
     });
     
     const rangeHeader = req.headers.get("Range");
@@ -192,7 +180,7 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
     });
 
     if (!upstreamResp.ok && upstreamResp.status !== 206) {
-      return new Response(`Upstream rejected: ${upstreamResp.status}`, { status: 502 });
+      throw new Error(`CDN hulu menolak dengan status HTTP: ${upstreamResp.status}`);
     }
 
     const responseHeaders = new Headers();
@@ -204,7 +192,7 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
     const incomingContentType = upstreamResp.headers.get("Content-Type");
     responseHeaders.set(
       "Content-Type", 
-      incomingContentType && incomingContentType.includes("audio") ? incomingContentType : "audio/mp4"
+      incomingContentType && incomingContentType.includes("audio") ? incomingContentType : "audio/mpeg"
     );
     
     if (upstreamResp.headers.get("Content-Length")) responseHeaders.set("Content-Length", upstreamResp.headers.get("Content-Length")!);
