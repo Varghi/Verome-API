@@ -58,7 +58,7 @@ export async function handleStream(searchParams: URLSearchParams): Promise<Respo
         requestedId: id, timestamp: new Date().toISOString(),
       };
 
-      // Simpan ke Deno KV selama 2 jam jika objek kv aktif
+      // Simpan ke Deno KV selama 2 hours jika objek kv aktif
       if (kv) {
         await kv.set(cacheKey, responseData, { expireIn: 7200000 });
         console.log(`💾 [Cache Stored] Data stream dari Invidious berhasil disimpan ke Deno KV.`);
@@ -146,28 +146,20 @@ export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YT
 
 /**
  * ==========================================
- * TAMBAHAN REVISI: STREAM RELAY (ANTI-403)
+ * FIX VALIDASI: STREAM RELAY (ANTI-403)
  * ==========================================
- * Fungsi ini mengalirkan data (piping) musik secara murni dari sisi server Deno,
- * dievaluasi ketat agar hanya mengambil stream khusus audio (bukan gabungan video).
+ * Mengambil tautan manifes bita media secara murni dari sisi server.
+ * Logika Deno KV dilewati sepenuhnya khusus untuk stream URL agar anti-expired.
  */
 async function resolveUpstreamUrl(id: string): Promise<string> {
-  // 1. Ambil dari cache Deno KV dulu kalau ada
-  if (kv) {
-    const cached = await kv.get(["stream_cache", id]);
-    if (cached.value && (cached.value as any).streamingUrls?.length) {
-      const urls = (cached.value as any).streamingUrls;
-      const audioOnly = urls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
-      if (audioOnly.length > 0) return audioOnly[0].url;
-      return urls[0].url;
-    }
-  }
+  // REVISI FIXED: Pengecekan cache KV dihapus total untuk menghindari token kedaluwarsa (HTTP 502).
+  // Sistem dipaksa selalu meminta manifest bita media terbaru (fresh link) ke server hulu.
 
-  // 2. Coba via Piped Service
+  // 1. Coba ambil melalui Piped Service
   try {
     const piped = await fetchFromPiped(id);
     if (piped.success && piped.streamingUrls?.length) {
-      // Filter stream yang murni audio (M4A atau WebM Audio codec)
+      // Saring bita yang bertipe audio saja (M4A atau WebM Audio) untuk menghemat bandwidth
       const audioStreams = piped.streamingUrls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
       if (audioStreams.length > 0) {
         console.log(`[Relay Upstream] Menemukan Audio Stream murni dari Piped untuk ID: ${id}`);
@@ -180,7 +172,7 @@ async function resolveUpstreamUrl(id: string): Promise<string> {
     console.warn(`[Relay Upstream] Gagal memuat dari Piped: ${err.message}`);
   }
 
-  // 3. Fallback terakhir ke Invidious
+  // 2. Fallback terakhir ke Invidious jika Piped tidak merespons
   try {
     const invidious = await fetchFromInvidious(id);
     if (invidious.success && invidious.streamingUrls?.length) {
