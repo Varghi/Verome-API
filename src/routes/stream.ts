@@ -2,6 +2,7 @@
  * Stream Routes
  * /api/stream, /api/proxy, /api/music/find, /play/:id
  * Ultra-Resilient Architecture: Direct Native Stream Extractor (Zero External API Dependency)
+ * REVISI: Menggunakan Cobalt API Engine internal Pipe untuk Bypass Enkripsi Cipher
  */
 
 import { json, error, corsHeaders } from "../helpers/response.ts";
@@ -41,64 +42,44 @@ export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YT
 }
 
 /**
- * REVISI MANDIRI: Mengambil Manifes Audio Langsung Dari Innertube Tanpa Piped/Invidious
+ * REVISI SUPER RESILIENT: Menggunakan Cobalt API Engine internal Pipe untuk Bypass Enkripsi Cipher
  */
 export async function handleStreamRelay(req: Request, id: string): Promise<Response> {
   try {
-    console.log(`🚀 [Relay Engine] Mengekstrak langsung manifest stream YouTube ID: ${id}`);
+    console.log(`🚀 [Relay Engine] Mengekstrak bita audio via Cobalt API untuk ID: ${id}`);
     
-    // Hit langsung ke Innertube Android Client untuk mengekstrak manifes audio murni
-    const innertubeUrl = "https://www.youtube.com/youtubei/v1/player";
-    const payload = {
-      videoId: id,
-      context: {
-        client: {
-          clientName: "ANDROID_MUSIC",
-          clientVersion: "6.41.51",
-          hl: "en",
-          gl: "US",
-          utcOffsetMinutes: 0
-        }
-      }
+    // 1. Ketuk Cobalt API dari sisi server Deno untuk mendapatkan URL CDN murni yang siap pakai
+    const cobaltUrl = "https://api.cobalt.tools/api/json";
+    const cobaltPayload = {
+      url: `https://www.youtube.com/watch?v=${id}`,
+      downloadMode: "audio",
+      audioFormat: "mp3",
+      audioBitrate: "128"
     };
 
-    const ytResponse = await fetch(innertubeUrl, {
+    const cobaltResponse = await fetch(cobaltUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(cobaltPayload)
     });
 
-    if (!ytResponse.ok) {
-      throw new Error(`YouTube Innertube melempar eror HTTP status: ${ytResponse.status}`);
+    if (!cobaltResponse.ok) {
+      throw new Error(`Server API Cobalt menolak request dengan status: ${cobaltResponse.status}`);
     }
 
-    const playerData = await ytResponse.json();
-    const streamingData = playerData.streamingData;
-    
-    if (!streamingData || !streamingData.adaptiveFormats) {
-      throw new Error("Gagal mengekstrak streamingData atau formats dari YouTube.");
-    }
-
-    // Filter format audio saja (M4A / OPUS)
-    const audioFormats = streamingData.adaptiveFormats.filter((f: any) => 
-      f.mimeType && f.mimeType.includes("audio")
-    );
-
-    if (!audioFormats.length) {
-      throw new Error("Tidak ada format audio adaptif yang tersedia untuk lagu ini.");
-    }
-
-    // Ambil format pertama (biasanya bitrate terbaik yang stabil)
-    const targetStream = audioFormats[0];
-    const upstreamUrl = targetStream.url;
+    const cobaltData = await cobaltResponse.json();
+    const upstreamUrl = cobaltData.url;
 
     if (!upstreamUrl) {
-      throw new Error("URL bita hulu kosong atau terenkripsi signature cipher.");
+      throw new Error("Gagal mengantongi URL streaming langsung dari payload backend.");
     }
 
-    // Siapkan request streaming pipe ke Google Video CDN dengan header resmi mobile player
+    // 2. Siapkan request streaming pipe ke Google Video/Cobalt CDN dengan Range Header pendukung ExoPlayer
     const upstreamHeaders = new Headers({
-      "User-Agent": "com.google.android.youtube/19.05.36 (Linux; U; Android 10; g-build) gzip",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
       "Accept": "*/*",
       "Connection": "keep-alive"
     });
@@ -114,28 +95,26 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
     });
 
     if (!upstreamResp.ok && upstreamResp.status !== 206) {
-      throw new Error(`Google Video CDN menolak streaming bita dengan status: ${upstreamResp.status}`);
+      throw new Error(`Penyedia CDN menolak streaming bita dengan status: ${upstreamResp.status}`);
     }
 
+    // 3. Bangun kembali Response Headers yang rapi agar ExoPlayer Flutter bisa melakukan seeking/rewind
     const responseHeaders = new Headers();
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     responseHeaders.set("Access-Control-Allow-Headers", "Range, Content-Type");
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-    
-    const incomingContentType = upstreamResp.headers.get("Content-Type");
-    responseHeaders.set(
-      "Content-Type", 
-      incomingContentType && incomingContentType.includes("audio") ? incomingContentType : "audio/mp4"
-    );
+    responseHeaders.set("Content-Type", "audio/mp3"); // Paksa format mp3 sesuai output Cobalt Engine
     
     if (upstreamResp.headers.get("Content-Length")) responseHeaders.set("Content-Length", upstreamResp.headers.get("Content-Length")!);
     if (upstreamResp.headers.get("Content-Range")) responseHeaders.set("Content-Range", upstreamResp.headers.get("Content-Range")!);
     responseHeaders.set("Accept-Ranges", upstreamResp.headers.get("Accept-Ranges") || "bytes");
 
+    // 4. Lakukan Stream Piping langsung ke sisi Flutter App secara realtime
     const { readable, writable } = new TransformStream();
     upstreamResp.body?.pipeTo(writable).catch((_err) => {});
 
+    console.log(`✅ [Relay Engine] Sukses melakukan piping data audio .mp3 untuk ID: ${id}`);
     return new Response(readable, {
       status: upstreamResp.status,
       headers: responseHeaders,
