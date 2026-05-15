@@ -16,7 +16,8 @@ import { html as uiHtml } from "./ui.ts";
 import { handleSearch, handleSearchSuggestions, handleYTSearch } from "./src/routes/search.ts";
 import { handleContentRoutes } from "./src/routes/content.ts";
 import { handleDiscoverRoutes } from "./src/routes/discover.ts";
-import { handleStream, handleProxy, handleMusicFind } from "./src/routes/stream.ts";
+// REVISI: Tambahkan handleStreamRelay ke dalam daftar import dari stream.ts
+import { handleStream, handleProxy, handleMusicFind, handleStreamRelay } from "./src/routes/stream.ts";
 import { handleInfoRoutes } from "./src/routes/info.ts";
 import { handleFeedRoutes } from "./src/routes/feed.ts";
 
@@ -69,7 +70,20 @@ async function handler(req: Request): Promise<Response> {
     const discoverResponse = await handleDiscoverRoutes(pathname, searchParams, ytmusic, youtubeSearch);
     if (discoverResponse) return discoverResponse;
 
-    // ─── Streaming ──────────────────────────────────────────
+    // ─── REVISI: Streaming Relay Proxy (Anti-403) ────────────
+    // Menangkap request dengan format /play/VIDEO_ID
+    if (pathname.startsWith("/play/")) {
+      const segments = pathname.split("/");
+      const id = segments[2]; // Mengambil ID setelah karakter slash kedua
+      
+      if (!id) {
+        return json({ error: "Missing video id in path" }, 400);
+      }
+      
+      return await handleStreamRelay(req, id);
+    }
+
+    // ─── Streaming Tradisional ──────────────────────────────
     if (pathname === "/api/music/find") return await handleMusicFind(searchParams, ytmusic);
     if (pathname === "/api/stream") return await handleStream(searchParams);
     if (pathname === "/api/proxy") return await handleProxy(searchParams, req);
