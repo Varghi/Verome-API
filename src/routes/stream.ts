@@ -148,43 +148,63 @@ export async function handleMusicFind(searchParams: URLSearchParams, ytmusic: YT
  * ==========================================
  * TAMBAHAN REVISI: STREAM RELAY (ANTI-403)
  * ==========================================
- * Fungsi ini bertindak sebagai jembatan (pipe) yang menarik bytes data dari CDN
- * menggunakan IP Server Deno, sehingga melewati pembatasan IP-Lock perangkat HP.
+ * Fungsi ini mengalirkan data (piping) musik secara murni dari sisi server Deno,
+ * dievaluasi ketat agar hanya mengambil stream khusus audio (bukan gabungan video).
  */
 async function resolveUpstreamUrl(id: string): Promise<string> {
-  // Coba ambil manifest dari cache Deno KV dulu lewat format extractor internal kamu
+  // 1. Ambil dari cache Deno KV dulu kalau ada
   if (kv) {
     const cached = await kv.get(["stream_cache", id]);
     if (cached.value && (cached.value as any).streamingUrls?.length) {
-      return (cached.value as any).streamingUrls[0].url;
+      const urls = (cached.value as any).streamingUrls;
+      const audioOnly = urls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
+      if (audioOnly.length > 0) return audioOnly[0].url;
+      return urls[0].url;
     }
   }
 
-  // Jika cache miss, panggil Piped Service
-  const piped = await fetchFromPiped(id);
-  if (piped.success && piped.streamingUrls?.length) {
-    return piped.streamingUrls[0].url;
+  // 2. Coba via Piped Service
+  try {
+    const piped = await fetchFromPiped(id);
+    if (piped.success && piped.streamingUrls?.length) {
+      // Filter stream yang murni audio (M4A atau WebM Audio codec)
+      const audioStreams = piped.streamingUrls.filter((s: any) => s.type === "audio" || s.format === "M4A" || !s.quality);
+      if (audioStreams.length > 0) {
+        console.log(`[Relay Upstream] Menemukan Audio Stream murni dari Piped untuk ID: ${id}`);
+        return audioStreams[0].url;
+      }
+      console.log(`[Relay Upstream] Mengambil stream indeks utama dari Piped.`);
+      return piped.streamingUrls[0].url;
+    }
+  } catch (err) {
+    console.warn(`[Relay Upstream] Gagal memuat dari Piped: ${err.message}`);
   }
 
-  // Fallback terakhir ke Invidious Service
-  const invidious = await fetchFromInvidious(id);
-  if (invidious.success && invidious.streamingUrls?.length) {
-    return invidious.streamingUrls[0].url;
+  // 3. Fallback terakhir ke Invidious
+  try {
+    const invidious = await fetchFromInvidious(id);
+    if (invidious.success && invidious.streamingUrls?.length) {
+      console.log(`[Relay Upstream] Menggunakan Stream dari Invidious untuk ID: ${id}`);
+      return invidious.streamingUrls[0].url;
+    }
+  } catch (err) {
+    console.warn(`[Relay Upstream] Gagal memuat dari Invidious: ${err.message}`);
   }
 
-  throw new Error("Tidak ada link streaming hulu yang tersedia");
+  throw new Error("Tidak ada link streaming hulu yang valid dari penyuplai data.");
 }
 
 export async function handleStreamRelay(req: Request, id: string): Promise<Response> {
   try {
     console.log(`🚀 [Relay] Menghubungkan pipe stream untuk videoId: ${id}`);
     
-    // 1. Dapatkan link googlevideo asli yang fresh
+    // 1. Dapatkan link googlevideo asli yang segar dan murni audio
     const upstreamUrl = await resolveUpstreamUrl(id);
+    console.log(`🔗 [Relay Upstream URL] Target CDN: ${upstreamUrl.substring(0, 60)}...`);
 
-    // 2. Salin header 'Range' dari Flutter jika ada (Penting untuk seek posisi lagu)
+    // 2. Salin header 'Range' dari ExoPlayer Flutter (Sangat vital untuk seek posisi/buffer lagu)
     const upstreamHeaders = new Headers({
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
       "Accept": "*/*",
       "Referer": "https://www.youtube.com/",
       "Origin": "https://www.youtube.com",
@@ -193,54 +213,64 @@ export async function handleStreamRelay(req: Request, id: string): Promise<Respo
     const rangeHeader = req.headers.get("Range");
     if (rangeHeader) {
       upstreamHeaders.set("Range", rangeHeader);
+      console.log(`🎯 [Relay Range Request] Meneruskan parameter Range: ${rangeHeader}`);
     }
 
-    // 3. Pasang AbortController agar jika koneksi client mati, Deno tidak membazirkan bandwidth download ke hulu
+    // 3. Pasang AbortController agar jika user mengganti lagu di Flutter, pipa download Deno langsung putus
     const upstreamController = new AbortController();
     const clientSignal = (req as any).signal;
     if (clientSignal) {
       clientSignal.addEventListener("abort", () => {
+        console.log(`🛑 [Relay] Media player Flutter memutus koneksi/skip lagu untuk ID: ${id}`);
         upstreamController.abort();
       });
     }
 
-    // 4. Request streaming bytes data ke target CDN
+    // 4. Lakukan request bita ke target CDN GoogleVideo
     const upstreamResp = await fetch(upstreamUrl, {
       method: "GET",
       headers: upstreamHeaders,
       signal: upstreamController.signal,
     });
 
+    console.log(`📡 [Relay Upstream Response] Status balasan dari CDN: ${upstreamResp.status}`);
+
     if (!upstreamResp.ok && upstreamResp.status !== 206) {
-      console.error(`❌ [Relay] Upstream menolak dengan status HTTP: ${upstreamResp.status}`);
+      console.error(`❌ [Relay] CDN Upstream mengembalikan error status: ${upstreamResp.status}`);
       return new Response(`Upstream rejected: ${upstreamResp.status}`, { status: 502 });
     }
 
-    // 5. Susun Header respons balik ke Flutter dengan mengizinkan CORS penuh
+    // 5. Susun Header respons balik dengan mengaktifkan CORS penuh untuk Flutter
     const responseHeaders = new Headers();
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     responseHeaders.set("Access-Control-Allow-Headers", "Range, Content-Type");
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-    responseHeaders.set("Content-Type", upstreamResp.headers.get("Content-Type") || "audio/webm");
+    
+    // Pastikan content-type berupa audio agar dideteksi dengan sempurna oleh media player Android
+    const incomingContentType = upstreamResp.headers.get("Content-Type");
+    responseHeaders.set(
+      "Content-Type", 
+      incomingContentType && incomingContentType.includes("audio") ? incomingContentType : "audio/mpeg"
+    );
     
     if (upstreamResp.headers.get("Content-Length")) responseHeaders.set("Content-Length", upstreamResp.headers.get("Content-Length")!);
     if (upstreamResp.headers.get("Content-Range")) responseHeaders.set("Content-Range", upstreamResp.headers.get("Content-Range")!);
     responseHeaders.set("Accept-Ranges", upstreamResp.headers.get("Accept-Ranges") || "bytes");
 
-    // 6. Alirkan bita data (Piping Body) secara real-time via TransformStream agar aman dari unhandled exception
+    // 6. Alirkan bita data (Piping Body) secara real-time via TransformStream agar terhindar dari crash unhandled exception
     const { readable, writable } = new TransformStream();
     upstreamResp.body?.pipeTo(writable).catch((err) => {
-      console.log("ℹ️ [Relay] Stream diputus oleh media player di Flutter (Normal). Messsage:", err.message);
+      console.log(`ℹ️ [Relay Log] Aliran pipa selesai dilepaskan atau diputus normal: ${err.message}`);
     });
 
     return new Response(readable, {
-      status: upstreamResp.status, // Otomatis mengirim kode status 200 atau 206 dari upstream
+      status: upstreamResp.status, // Teruskan status 200 atau 206 (Partial Content)
       headers: responseHeaders,
     });
 
   } catch (err) {
-    console.error(`❌ [Relay Fatal Error]: ${err}`);
-    return new Response("Relay internal failure", { status: 502 });
+    console.error(`❌ [Relay Fatal Error]: ${err.message}`);
+    return new Response(`Relay internal failure: ${err.message}`, { status: 502 });
   }
 }
