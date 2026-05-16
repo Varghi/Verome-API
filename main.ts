@@ -31,18 +31,18 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const { pathname, searchParams } = url;
 
-  // CORS preflight
+  // CORS preflight - Penting agar Flutter/Android tidak memblokir request hulu
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    // Root - UI
+    // Root - UI Dashboard
     if (pathname === "/") {
       return new Response(uiHtml, { headers: { "Content-Type": "text/html", ...corsHeaders } });
     }
 
-    // Logo
+    // Logo Asset Handler
     if (pathname === "/assets/logo.png" || pathname === "/assets/Logo.png") {
       try {
         const logoPath = new URL("./assets/Logo.png", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
@@ -56,20 +56,18 @@ async function handler(req: Request): Promise<Response> {
     if (pathname === "/favicon.ico") return new Response(null, { status: 204 });
     if (pathname === "/health") return json({ status: "ok", version: "2.0.0" });
 
-    // ─── Search ─────────────────────────────────────────────
-    if (pathname === "/api/search") return await handleSearch(req, searchParams, ytmusic, youtubeSearch);
-    if (pathname === "/api/search/suggestions") return await handleSearchSuggestions(searchParams, ytmusic, youtubeSearch);
-    if (pathname === "/api/yt_search") return await handleYTSearch(searchParams, youtubeSearch);
+    // ─── Search (Diprioritaskan ke atas agar responsif) ──────
+    if (pathname === "/api/search") {
+      return await handleSearch(req, searchParams, ytmusic, youtubeSearch);
+    }
+    if (pathname === "/api/search/suggestions") {
+      return await handleSearchSuggestions(searchParams, ytmusic, youtubeSearch);
+    }
+    if (pathname === "/api/yt_search") {
+      return await handleYTSearch(searchParams, youtubeSearch);
+    }
 
-    // ─── Content (entities) ─────────────────────────────────
-    const contentResponse = await handleContentRoutes(pathname, searchParams, ytmusic);
-    if (contentResponse) return contentResponse;
-
-    // ─── Discovery ──────────────────────────────────────────
-    const discoverResponse = await handleDiscoverRoutes(pathname, searchParams, ytmusic, youtubeSearch);
-    if (discoverResponse) return discoverResponse;
-
-    // ─── Streaming Relay Proxy (Anti-403) ────────────
+    // ─── Streaming Relay Proxy (Anti-403 & Anti-502) ─────────
     if (pathname.startsWith("/play/")) {
       const segments = pathname.split("/");
       const id = segments[2];
@@ -86,6 +84,14 @@ async function handler(req: Request): Promise<Response> {
     if (pathname === "/api/stream") return await handleStream(searchParams);
     if (pathname === "/api/proxy") return await handleProxy(searchParams, req);
 
+    // ─── Content (entities) ─────────────────────────────────
+    const contentResponse = await handleContentRoutes(pathname, searchParams, ytmusic);
+    if (contentResponse) return contentResponse;
+
+    // ─── Discovery ──────────────────────────────────────────
+    const discoverResponse = await handleDiscoverRoutes(pathname, searchParams, ytmusic, youtubeSearch);
+    if (discoverResponse) return discoverResponse;
+
     // ─── Info (lyrics, artist/track info) ───────────────────
     const infoResponse = await handleInfoRoutes(pathname, searchParams);
     if (infoResponse) return infoResponse;
@@ -94,11 +100,11 @@ async function handler(req: Request): Promise<Response> {
     const feedResponse = await handleFeedRoutes(pathname, searchParams);
     if (feedResponse) return feedResponse;
 
-    // ─── 404 ────────────────────────────────────────────────
+    // ─── 404 Route Not Found Fallback ───────────────────────
     return json({ error: "Route not found", path: pathname }, 404);
 
   } catch (err) {
-    console.error("Error:", err);
+    console.error("Fatal Router Error:", err);
     return json({ error: "Internal server error", message: String(err) }, 500);
   }
 }
@@ -106,5 +112,5 @@ async function handler(req: Request): Promise<Response> {
 // ─── Start Server ───────────────────────────────────────────
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
-console.log(`Verome API v2.0.0 running on http://localhost:${PORT}`);
+console.log(`Verome API v2.0.0 running on port ${PORT}`);
 Deno.serve({ port: PORT }, handler);
